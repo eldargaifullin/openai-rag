@@ -1,0 +1,197 @@
+# Step 1: Install necessary libraries
+# Uncomment the following lines if running in a new environment
+'''
+!pip install langchain openai sentence-transformers chromadb PyMuPDF
+!pip install -U langchain-community langchain-openai tiktoken  # Added tiktoken
+!pip install openai==1.2.0 langchain==0.0.304
+!pip install chromadb==0.4.15
+!pip install openai==0.27.0
+'''
+!pwd  # check the current dir
+
+# Step 2: Import libraries
+import openai  # Import the OpenAI library to interact with OpenAI's API for language models.
+import os  # Import the os library for operating system functionality, like file path manipulation.
+import fitz  # Import the fitz module (from PyMuPDF) for PDF processing and reading PDF documents.
+import langchain
+import chromadb
+
+from langchain.embeddings import OpenAIEmbeddings  # Import OpenAIEmbeddings from LangChain for embedding documents using OpenAI's models.
+from langchain.vectorstores import Chroma  # Import Chroma from LangChain for creating a vector store to store and retrieve embeddings.
+from langchain.chat_models import ChatOpenAI  # Import ChatOpenAI from LangChain for using OpenAI's chat models for conversation.
+from langchain.chains import RetrievalQA  # Import RetrievalQA from LangChain for creating a retrieval-augmented generation (RAG) chain for question-answering.
+from langchain.document_loaders import TextLoader  # Import TextLoader from LangChain to load text documents for processing.
+from langchain.text_splitter import RecursiveCharacterTextSplitter  # Import RecursiveCharacterTextSplitter to split text into manageable chunks based on character count.
+from langchain.schema import Document  # Import Document from LangChain schema to create document objects
+from langchain.llms import OpenAI
+
+print("LangChain version:", langchain.__version__)
+print("ChromaDB version:", chromadb.__version__)
+
+# Step 3: Set configurations and initialize variables
+openai.api_key = "<YOUR_OPENAI_KEY_GOES_HERE>"
+pdf_directory = "/content"  # Path to the directory with PDF files
+
+# Model configurations
+model_config = {
+    "temperature": 0.7,
+    "max_tokens": 500
+}
+
+# RAG Configurations
+rag_enabled = True  # Toggle RAG on/off
+chunk_size = 500  # Chunk size when splitting documents
+chunk_overlap = 100  # Overlap size for continuity
+
+# Define a custom instruction template for the LLM
+system_prompt = """You are a student advisor bot for Hochschule Neu-Ulm (HNU).
+Always respond only in English, regardless of the content or language of the documents. If documents contain German text, translate or paraphrase them into English."""
+
+# Step 4: Helper function to load and process PDFs from a directory
+def load_pdfs_from_directory(directory_path):
+    text_chunks = []
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".pdf"):
+            print("Processing file:", filename)
+            with fitz.open(os.path.join(directory_path, filename)) as pdf:
+                for page in pdf:
+                    text = page.get_text("text")
+                    text_chunks.append({"text": text, "source": filename})
+    if not text_chunks:
+        print("Warning: No text found in the PDFs. Check the directory or PDF contents.")
+    return text_chunks
+
+# Step 5: Load PDFs and split text into chunks
+raw_text_chunks = load_pdfs_from_directory(pdf_directory)
+
+# Initialize list to store documents with chunks and metadata
+documents = []
+
+# Split each loaded document text into chunks with metadata
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+for doc in raw_text_chunks:
+    split_texts = text_splitter.split_text(doc["text"])  # Split text into chunks
+    for chunk in split_texts:
+        # Create a new Document object for each chunk, preserving the source metadata
+        documents.append(Document(page_content=chunk, metadata={"source": doc["source"]}))
+
+# Step 6: Embed documents and build Chroma vector store
+embedding_function = OpenAIEmbeddings(openai_api_key=openai.api_key)
+
+# Set up Chroma vector store with the embedded documents
+vector_store = Chroma.from_documents(documents, embedding_function)
+retriever = vector_store.as_retriever()
+
+# Step 7: Set up LangChain with RAG, including top_p in model_kwargs
+llm = ChatOpenAI(
+    model="<YOUR_GPT4_MODEL_NAME>",
+    openai_api_key=openai.api_key,
+    temperature=model_config["temperature"],
+    max_tokens=model_config["max_tokens"],
+    top_p=0.9
+)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True,
+    chain_type="stuff"
+)
+
+# Function to enforce that the response is in English
+def enforce_english(response):
+    translation_prompt = "Please translate the following text into English:\n\n" + response
+    translated_response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "user", "content": translation_prompt}
+        ],
+        temperature=model_config["temperature"],
+        max_tokens=model_config["max_tokens"]
+    )['choices'][0]['message']['content']
+    return translated_response
+
+# Step 8: Main Chatbot Loop with RAG
+def chatbot_loop():
+    print("Welcome to the HNU Advisor bot! Type 'exit' to quit.")
+    print("====================================================")
+
+    conversation_history = []  # To keep track of the conversation history
+    last_response = ""  # To remember the last response for repeat requests
+
+    # Define a list of common greeting or casual phrases
+    non_informational_phrases = [
+        "hello", "hi", "hey", "good morning", "good afternoon",
+        "good evening", "how are you", "what's up"
+    ]
+
+    while True:
+        user_input = input("Your question: ").strip().lower()
+        if user_input == "exit":
+            print("Goodbye!")
+            break
+
+        # Check if the user wants to repeat the last response
+        if user_input in ["repeat", "repeat my last message"]:
+            if last_response:
+                print(f"HNU Advisor: {last_response}")
+                continue
+            else:
+                print("HNU Advisor: No previous message to repeat.")
+                continue
+
+        # Check if the user wants a translation
+        if user_input == "translate to english":
+            if last_response:
+                translated_response = enforce_english(last_response)
+                print(f"HNU Advisor: {translated_response}")
+                continue
+            else:
+                print("HNU Advisor: No previous message to translate.")
+                continue
+
+        # Check if the input is a non-informational greeting or casual phrase
+        if any(phrase in user_input for phrase in non_informational_phrases):
+            # Respond without retrieving documents
+            print("HNU Advisor: Hello there! How can I help you today?")
+            continue
+
+        # Append the user's input to the conversation history
+        conversation_history.append({"role": "user", "content": user_input})
+
+        # Set up context for RAG if enabled
+        if rag_enabled:
+            response = qa_chain({"query": user_input})
+            answer = response['result']  # Assuming qa_chain returns a structured response
+            source_documents = response.get('source_documents', [])
+
+            # Extract the file names, excluding "Unknown source"
+            source_files = "\n".join(
+                {doc.metadata['source'] for doc in source_documents if doc.metadata.get('source')}
+            )
+        else:
+            response = openai.ChatCompletion.create(
+                model="ft:gpt-4o-2024-08-06:hnu:politics-religion-filter:AJQK71Bv",
+                messages=[{"role": "system", "content": system_prompt}] + conversation_history,
+                temperature=model_config["temperature"],
+                max_tokens=model_config["max_tokens"]
+            )
+            answer = response['choices'][0]['message']['content']
+            source_files = "Context retrieval disabled."
+
+        # Enforce response to be in English
+        answer = enforce_english(answer)
+
+        # Append the bot's response to the conversation history
+        conversation_history.append({"role": "assistant", "content": answer})
+
+        # Remember the last response for repeat and translation requests
+        last_response = answer
+
+        # Display the answer along with the source file names
+        print(f"HNU Advisor: {answer}")
+        if source_files:
+            print("Source Files Used:\n", source_files)
+
+# Run the chatbot
+chatbot_loop()
